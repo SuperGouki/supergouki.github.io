@@ -20,4 +20,5 @@ python server.py
 Configured as a static site deployment, serving files from the root directory.
 
 ## Recent Changes
+- January 25, 2026: Added scroll-triggered animation for the Lyft car animation - now starts only when user scrolls to Experience section
 - January 25, 2026: Initial Replit setup with Python static file server
