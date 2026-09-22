@@ -53,12 +53,19 @@
 
       /* Same pre-existing component also renders a plain CSS vignette (fixed
          full-screen radial-gradient fading to a dark edge) behind the hero
-         text, unrelated to the WebGL scene entirely — it's there at idle too,
-         just more noticeable once the scene brightens during the OIIA track.
-         No stable selector for just this layer, so match it by its inline
-         style; body.oiia-playing is toggled by the click handler below. */
-      div[style*="radial-gradient(ellipse at center"] { transition: opacity 0.6s ease; }
-      body.oiia-playing div[style*="radial-gradient(ellipse at center"] { opacity: 0; }
+         text, at idle. It used to be papering over a real overexposure
+         problem (CONFIG.exposure defaulted to 2.4, and ACES filmic
+         tonemapping's shoulder compresses roughly 0.5-3+ toward the same
+         near-white output regardless of what individual light you dialed
+         back) — that's fixed now at the source, so the vignette is back to
+         being a normal, intentional design element again. Faded out only
+         while the OIIA track plays, via body.oiia-playing toggled in the
+         click/ended handlers below. Matched on the serialized style — Chrome
+         drops the default "ellipse at center" and rewrites hsl() to rgb()
+         when reflecting the attribute — verified against the live DOM, not
+         the JSX source. */
+      div[style*="radial-gradient(transparent 0%"] { transition: opacity 0.6s ease; }
+      body.oiia-playing div[style*="radial-gradient(transparent 0%"] { opacity: 0; }
 
       /* Grey body copy -> white, and bold the (white) link text. */
       .text-muted-foreground { color: #ffffff !important; }
@@ -138,7 +145,7 @@ const CONFIG = {
   fov:            36,
 
   // post
-  exposure:       2.4,
+  exposure:       0.19,
   bloomStrength:  1.30,
   bloomThreshold: 0.82,       // emissive mask: lit geometry sits below this
   bloomKnee:      0.35,
@@ -175,7 +182,7 @@ const CONFIG = {
   // beams cross rather than move in lockstep. Reimplemented on the classic
   // r128 SpotLight (no IES texture/WebGPU here) since that's what this scene
   // already renders with.
-  partyLightIntensity: 1.1,   // real scene illumination only; the beam line's own visibility is separate
+  partyLightIntensity: 0.5,   // real scene illumination only; the beam line's own visibility is separate
   partyLightFadeRate:  6.0    // 1/s ease when the show turns on/off
 };
 
@@ -1382,8 +1389,8 @@ for (let i = 0; i < 7; i++) {
 /* ============================================================================
    LIGHTING — emissive-driven, so these are bounce fill only
    ========================================================================== */
-scene.add(new THREE.AmbientLight(0x1a1026, 1.8));
-scene.add(new THREE.HemisphereLight(0x281038, 0x05030a, 1.1));
+scene.add(new THREE.AmbientLight(0x1a1026, 0.3));
+scene.add(new THREE.HemisphereLight(0x281038, 0x05030a, 0.2));
 
 // positions are bay-local and sit on the four front posts: the inner pair at
 // +/-0.04 is the double strip where the two frames meet
@@ -1744,7 +1751,7 @@ function updateLEDs(t) {
     // breathing backbone, desynced between racks
     const pulse = 1.0 - CONFIG.ledPulseDepth * 0.5 *
       (1.0 - Math.cos((t / CONFIG.ledPulsePeriod) * Math.PI * 2 + r.phaseOffset));
-    const k = CONFIG.ledIntensity * pulse * (strobing ? 1.0 + audioViz.flash * 0.5 : 1.0);
+    const k = CONFIG.ledIntensity * pulse;   // strobing changes hue only, not brightness — see AUDIO VIZ note above
 
     for (let i = 0; i < r.stripDefs.length; i++) {
       // a slow travelling wave stops the strip reading as a solid bar
@@ -1756,7 +1763,7 @@ function updateLEDs(t) {
 
     r.streaks.forEach(function (s) { s.material.opacity = 0.30 * pulse; });
 
-    const lightBoost = strobing ? 1.0 + audioViz.flash * 0.4 : 1.0;
+    const lightBoost = 1.0;   // real point-light intensity unchanged from idle; only its color strobes
     stripLights[ri * 2].intensity     = CONFIG.ledLightPower * pulse * lightBoost;
     stripLights[ri * 2 + 1].intensity = CONFIG.ledLightPower * pulse * 0.92 * lightBoost;
     if (strobing) { stripLights[ri * 2].color.copy(tint); stripLights[ri * 2 + 1].color.copy(tint); }
@@ -2008,7 +2015,7 @@ function tick() {
     });
     if (audioViz.active) {
       coolLight.color.copy(strobeScratch);
-      coolLight.intensity = CONFIG.accentPower * (1.0 + audioViz.flash * 0.4);
+      coolLight.intensity = CONFIG.accentPower;   // unchanged from idle; only its color strobes
     } else {
       if (coolLight.color.getHex() !== CONFIG.accentColor) coolLight.color.set(CONFIG.accentColor);
       coolLight.intensity = CONFIG.accentPower * (0.9 + 0.1 * Math.sin(t * 0.9));
@@ -2032,7 +2039,7 @@ function tick() {
       );
 
       pl.envelope += (envelopeTarget - pl.envelope) * Math.min(1, dt * CONFIG.partyLightFadeRate);
-      pl.light.intensity = CONFIG.partyLightIntensity * pl.envelope * (0.6 + audioViz.flash * 0.4);
+      pl.light.intensity = CONFIG.partyLightIntensity * pl.envelope;
       pl.beam.material.opacity = pl.envelope * 0.3;
       if (pl.envelope > 0.01) {
         pl.target.getWorldPosition(partyBeamTargetWorld);
