@@ -51,6 +51,15 @@
          scene isn't dimmed/grid-textured by it. */
       [data-testid="matrix-rain"] { display: none !important; }
 
+      /* Same pre-existing component also renders a plain CSS vignette (fixed
+         full-screen radial-gradient fading to a dark edge) behind the hero
+         text, unrelated to the WebGL scene entirely — it's there at idle too,
+         just more noticeable once the scene brightens during the OIIA track.
+         No stable selector for just this layer, so match it by its inline
+         style; body.oiia-playing is toggled by the click handler below. */
+      div[style*="radial-gradient(ellipse at center"] { transition: opacity 0.6s ease; }
+      body.oiia-playing div[style*="radial-gradient(ellipse at center"] { opacity: 0; }
+
       /* Grey body copy -> white, and bold the (white) link text. */
       .text-muted-foreground { color: #ffffff !important; }
       a { font-weight: 700; }
@@ -166,7 +175,7 @@ const CONFIG = {
   // beams cross rather than move in lockstep. Reimplemented on the classic
   // r128 SpotLight (no IES texture/WebGPU here) since that's what this scene
   // already renders with.
-  partyLightIntensity: 2.6,
+  partyLightIntensity: 1.1,   // real scene illumination only; the beam line's own visibility is separate
   partyLightFadeRate:  6.0    // 1/s ease when the show turns on/off
 };
 
@@ -1428,7 +1437,7 @@ const partyLights = PARTY_LIGHT_DEFS.map(function (d) {
   beam.position.copy(light.position);
   bay.add(beam);
 
-  return { light: light, target: target, beam: beam, phase: d.phase, a: d.a, b: d.b, curIntensity: 0 };
+  return { light: light, target: target, beam: beam, phase: d.phase, a: d.a, b: d.b, envelope: 0 };
 });
 const partyBeamTargetWorld = new THREE.Vector3();
 
@@ -1912,10 +1921,12 @@ if (spinBtn) {
     audioViz.active = true;
     audioViz.beatIdx = 0;
     audioViz.spinVel += CONFIG.audioSpinKick;
+    document.body.classList.add('oiia-playing');   // fades out the page's own vignette, see CSS
   });
   spinSound.addEventListener('ended', function () {
     audioViz.active = false;
     audioViz.flash = 0;
+    document.body.classList.remove('oiia-playing');
   });
 }
 
@@ -2004,8 +2015,13 @@ function tick() {
     }
 
     // party lights: sweep the targets continuously (harmless while dark), but
-    // only fade the beams in while the track is actually active.
-    const partyTarget = audioViz.active ? CONFIG.partyLightIntensity * (0.45 + audioViz.flash * 0.5) : 0;
+    // only fade in while the track is actually active. The visible beam's
+    // opacity is driven by envelope alone, decoupled from the SpotLight's
+    // actual scene-illumination intensity below — that real light is kept
+    // deliberately dim (it's what was blowing bloom out into a big halo
+    // across the whole rack), while the thin beam line still reads clearly
+    // as a moving light on its own.
+    const envelopeTarget = audioViz.active ? 1.0 : 0.0;
     partyLights.forEach(function (pl) {
       pl.phase += dt * (0.7 + audioViz.overall * 2.3);
       const u = (Math.sin(pl.phase) + 1) / 2;
@@ -2015,10 +2031,10 @@ function tick() {
         pl.a[2] + (pl.b[2] - pl.a[2]) * u
       );
 
-      pl.curIntensity += (partyTarget - pl.curIntensity) * Math.min(1, dt * CONFIG.partyLightFadeRate);
-      pl.light.intensity = pl.curIntensity;
-      pl.beam.material.opacity = Math.min(0.4, (pl.curIntensity / CONFIG.partyLightIntensity) * 0.32);
-      if (pl.curIntensity > 0.01) {
+      pl.envelope += (envelopeTarget - pl.envelope) * Math.min(1, dt * CONFIG.partyLightFadeRate);
+      pl.light.intensity = CONFIG.partyLightIntensity * pl.envelope * (0.6 + audioViz.flash * 0.4);
+      pl.beam.material.opacity = pl.envelope * 0.3;
+      if (pl.envelope > 0.01) {
         pl.target.getWorldPosition(partyBeamTargetWorld);
         pl.beam.lookAt(partyBeamTargetWorld);
         pl.beam.scale.setScalar(pl.light.position.distanceTo(pl.target.position));
