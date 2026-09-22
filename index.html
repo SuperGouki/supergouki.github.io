@@ -64,6 +64,23 @@
         text-shadow: 0 2px 16px rgba(0,0,0,0.65);
       }
       #spin-rack-btn:hover { color: #ff9be8; }
+
+      /* Phones / tablets / narrow windows: the fixed desktop offset above lands
+         off-screen or off the rack, so the script pins the button to a point on
+         rack 2 each frame instead (placeSpinBtn). Keep this query in sync with
+         SPIN_PIN_QUERY in the script. Desktop keeps the rules above untouched. */
+      @media (max-width: 1023px), (max-aspect-ratio: 1/1), (pointer: coarse) {
+        #spin-rack-btn {
+          top: 0; left: 0; right: auto;
+          padding: 12px 14px; font-size: 18px;
+          opacity: 0; pointer-events: none;        /* until first placed */
+          transition: opacity 0.4s ease;
+          -webkit-tap-highlight-color: transparent;
+          touch-action: manipulation;
+        }
+        #spin-rack-btn.placed { opacity: 1; pointer-events: auto; }
+        #spin-rack-btn:active { color: #ff9be8; }
+      }
     </style>
   </head>
   <body>
@@ -1726,6 +1743,37 @@ if (spinBtn) {
   });
 }
 
+// ---- keep the button on rack 2 when the fixed desktop offset can't be used ----
+// Same query as the @media block in the stylesheet. Where it matches, the
+// button is placed at the projected screen position of a point on rack 2's
+// front face, so it stays on the rack whatever the viewport framing is.
+const SPIN_PIN_QUERY = '(max-width: 1023px), (max-aspect-ratio: 1/1), (pointer: coarse)';
+const spinPinMQ = window.matchMedia(SPIN_PIN_QUERY);
+const SPIN_ANCHOR_Y = uY(42, 1) + 0.09;   // top of rack 2, just under the frame cap: clear of the hero heading on portrait
+const SPIN_EDGE_PAD = 8;                  // px kept clear of the screen edge
+const spinAnchor = new THREE.Vector3();
+
+function placeSpinBtn() {
+  if (!spinBtn) return;
+  if (!spinPinMQ.matches) {               // desktop: CSS positions it
+    if (spinBtn.style.transform) {
+      spinBtn.style.transform = '';
+      spinBtn.classList.remove('placed');
+    }
+    return;
+  }
+  const rack = racks[1].group;            // the anchor is static: the spin only rotates the rack about its own axis
+  spinAnchor.set(rack.position.x, SPIN_ANCHOR_Y, FRONT_Z);
+  bay.localToWorld(spinAnchor).project(camera);
+
+  const vw = window.innerWidth, vh = window.innerHeight;
+  const half = spinBtn.offsetWidth / 2 + SPIN_EDGE_PAD;
+  const x = Math.min(Math.max((spinAnchor.x * 0.5 + 0.5) * vw, half), vw - half);
+  const y = (-spinAnchor.y * 0.5 + 0.5) * vh;
+  spinBtn.style.transform = 'translate3d(' + x.toFixed(1) + 'px,' + y.toFixed(1) + 'px,0) translate(-50%,-50%)';
+  spinBtn.classList.add('placed');
+}
+
 function tick() {
   requestAnimationFrame(tick);
   // getDelta() must come first: getElapsedTime() consumes the delta internally
@@ -1761,6 +1809,7 @@ function tick() {
 
   updateCamera(t);
   renderPost(t);
+  placeSpinBtn();
 
   if (!booted && frame > 2) {
     booted = true;
