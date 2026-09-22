@@ -20,5 +20,6 @@ python server.py
 Configured as a static site deployment, serving files from the root directory.
 
 ## Recent Changes
+- September 21, 2026: Reworked the rack-spin gimmick into a beat-synced audio/light show - clicking the button now plays a trimmed OIIA OIIA remix clip, drives rack rotation off a bass beat detector, and strobes the LED strips/bloom/exposure in hot pink and violet
 - January 25, 2026: Added scroll-triggered animation for the Lyft car animation - now starts only when user scrolls to Experience section
 - January 25, 2026: Initial Replit setup with Python static file server
