@@ -141,7 +141,20 @@ const CONFIG = {
   vignette:       0.0,
   blackCrush:     0.0,
 
-  maxPixelRatio:  1.5
+  maxPixelRatio:  1.5,
+
+  // audio-reactive spin + light show, driven by the OIIA click (see AUDIO VIZ)
+  audioBeatSensitivity: 1.35,  // bass must exceed (rolling avg * this) to count as a beat
+  audioBeatFloor:       0.16,  // and clear this absolute noise floor (0..1)
+  audioBeatMinInterval: 0.20,  // seconds; caps detection at ~300bpm
+  audioSpinKick:        3.2,   // rad/s added to spin velocity per click, before the first beat lands
+  audioSpinImpulse:     5.0,   // rad/s added to spin velocity per detected beat
+  audioSpinDrive:       2.6,   // rad/s^2 continuous push from overall energy, on top of beat kicks
+  audioSpinDrag:        1.8,   // 1/s exponential decay on spin velocity
+  audioFlashDecay:      7.0,   // 1/s decay of the per-beat light flash
+  audioBloomBoost:      2.8,   // extra bloomStrength at full flash
+  audioExposureBoost:   0.85,  // extra exposure at full flash
+  audioStrobeColors: [0xff2ec4, 0xc026ff, 0xff36e0, 0x9b30ff, 0xff0090, 0x7a1fff]
 };
 
 /* ============================================================================
@@ -149,6 +162,7 @@ const CONFIG = {
    ========================================================================== */
 const canvas = document.getElementById('scene-canvas');
 const veil   = document.getElementById('veil');
+const bgScrim = document.getElementById('bg-scrim');
 const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
 const renderer = new THREE.WebGLRenderer({
@@ -1628,27 +1642,58 @@ const ORBIT = new THREE.Vector3(-0.11, 1.22, 0.20);   // bay front face, between
 const scratch = new THREE.Color();
 let frame = 0;
 
+/* ============================================================================
+   AUDIO VIZ — the OIIA click wires a Web Audio analyser into the beat-detector
+   below, which drives both the rack spin and the strip-LED strobe. See the
+   click handler further down for how this gets kicked off, and tick() for
+   the per-frame beat sampling / spin integration / post-processing boost.
+   Skipped under prefers-reduced-motion: that click still plays the track and
+   spins the rack once, but without the strobing lights.
+   ========================================================================== */
+const audioViz = {
+  active: false,
+  overall: 0, bass: 0,
+  flash: 0,                                  // 0..1, spikes on each beat then decays
+  spinVel: 0,
+  colorFrom: new THREE.Color(CONFIG.ledColorA),
+  colorTo:   new THREE.Color(CONFIG.ledColorA),
+  colorT: 1,
+  colorIdx: 0,
+  bassHistory: [],
+  lastBeat: -1
+};
+const strobeScratch = new THREE.Color();
+
 function updateLEDs(t) {
+  const strobing = audioViz.active && !reduceMotion;
+  if (strobing) strobeScratch.copy(audioViz.colorFrom).lerp(audioViz.colorTo, audioViz.colorT);
+
   for (let ri = 0; ri < racks.length; ri++) {
     const r = racks[ri];
+    const tint = strobing ? strobeScratch : r.tint;
 
     // breathing backbone, desynced between racks
     const pulse = 1.0 - CONFIG.ledPulseDepth * 0.5 *
       (1.0 - Math.cos((t / CONFIG.ledPulsePeriod) * Math.PI * 2 + r.phaseOffset));
-    const k = CONFIG.ledIntensity * pulse;
+    const k = CONFIG.ledIntensity * pulse * (strobing ? 1.0 + audioViz.flash * 1.4 : 1.0);
 
     for (let i = 0; i < r.stripDefs.length; i++) {
       // a slow travelling wave stops the strip reading as a solid bar
       const wave = k * (0.86 + 0.14 * Math.sin(t * 1.15 - r.stripDefs[i].phase));
-      scratch.setRGB(r.tint.r * wave, r.tint.g * wave, r.tint.b * wave);
+      scratch.setRGB(tint.r * wave, tint.g * wave, tint.b * wave);
       r.strip.setColorAt(i, scratch);
     }
     r.strip.instanceColor.needsUpdate = true;
 
     r.streaks.forEach(function (s) { s.material.opacity = 0.30 * pulse; });
 
-    stripLights[ri * 2].intensity     = CONFIG.ledLightPower * pulse;
-    stripLights[ri * 2 + 1].intensity = CONFIG.ledLightPower * pulse * 0.92;
+    const lightBoost = strobing ? 1.0 + audioViz.flash * 1.8 : 1.0;
+    stripLights[ri * 2].intensity     = CONFIG.ledLightPower * pulse * lightBoost;
+    stripLights[ri * 2 + 1].intensity = CONFIG.ledLightPower * pulse * 0.92 * lightBoost;
+    if (strobing) { stripLights[ri * 2].color.copy(tint); stripLights[ri * 2 + 1].color.copy(tint); }
+    else if (stripLights[ri * 2].color.getHex() !== r.tint.getHex()) {
+      stripLights[ri * 2].color.copy(r.tint); stripLights[ri * 2 + 1].color.copy(r.tint);
+    }
 
     // port activity
     const defs = r.ledDefs;
@@ -1685,7 +1730,7 @@ function updateCamera(t) {
   camera.lookAt(ORBIT.x, ORBIT.y + 0.06, ORBIT.z);
 }
 
-function renderPost(t) {
+function renderPost(t, flash, overall) {
   // 0 — rack 1's screen content, into its own small target
   carDash.render();
 
@@ -1724,23 +1769,110 @@ function renderPost(t) {
   u.tB2.value = bloomRT[2][0].texture;
   u.tB3.value = bloomRT[3][0].texture;
   u.time.value = t;
+  u.bloomStrength.value = CONFIG.bloomStrength + (flash || 0) * CONFIG.audioBloomBoost + (overall || 0) * 0.8;
+  u.exposure.value = CONFIG.exposure + (flash || 0) * CONFIG.audioExposureBoost;
   blit(compositeMat, null);
 }
 
 let booted = false;
 
-// ---- rack spin gimmick, triggered by the "Click Me!" button ----------------
-let rackSpin = null;
-const spinSound = new Audio('/assets/oiia-oiia-sound.mp3');
+// ---- rack spin + light show, triggered by the "Click Me!" button ----------
+// Clicking plays the track and, while it's live, a Web Audio analyser drives
+// a simple bass-energy beat detector: each detected beat kicks the rack's
+// spin velocity (which otherwise just decays) and pops a light-show flash
+// that strobes the strip LEDs through the hot-pink/violet palette and blows
+// out bloom/exposure for a frame or two. Between beats, overall energy keeps
+// a lower continuous spin going so it never fully stops mid-track.
+const spinSound = new Audio('/assets/oiia-remix.m4a');
+spinSound.preload = 'auto';
 const spinBtn = document.getElementById('spin-rack-btn');
+
+let audioCtx = null, analyser = null, freqData = null;
+let bassLo = 1, bassHi = 8;   // bin range, recomputed once we know the real sample rate
+
+function ensureAudioGraph() {
+  if (audioCtx) return;
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) return;                          // no Web Audio: track still plays, just without the viz
+  try {
+    audioCtx = new Ctx();
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 2048;
+    analyser.smoothingTimeConstant = 0.75;
+    freqData = new Uint8Array(analyser.frequencyBinCount);
+
+    const binHz = audioCtx.sampleRate / analyser.fftSize;
+    bassLo = Math.max(1, Math.round(20 / binHz));
+    bassHi = Math.max(bassLo + 1, Math.round(160 / binHz));
+
+    const src = audioCtx.createMediaElementSource(spinSound);
+    src.connect(analyser);
+    analyser.connect(audioCtx.destination);
+  } catch (e) {
+    audioCtx = null; analyser = null;         // e.g. Safari without a user gesture; just skip the viz
+  }
+}
+
+// Reads the current frequency spectrum, rolls a beat detector over the bass
+// band, and updates audioViz (spin velocity, flash, strobe color) from it.
+// No-op — leaving audioViz.overall/bass to decay towards 0 — once the track
+// stops or the analyser isn't available.
+function sampleAudio(t, dt) {
+  if (!analyser || spinSound.paused) {
+    audioViz.overall *= 0.9; audioViz.bass *= 0.9;
+    return;
+  }
+  analyser.getByteFrequencyData(freqData);
+
+  let bassSum = 0, allSum = 0;
+  for (let i = 0; i < freqData.length; i++) allSum += freqData[i];
+  for (let i = bassLo; i <= bassHi; i++) bassSum += freqData[i];
+  audioViz.overall = allSum / freqData.length / 255;
+  audioViz.bass = bassSum / (bassHi - bassLo + 1) / 255;
+
+  const hist = audioViz.bassHistory;
+  hist.push(audioViz.bass);
+  if (hist.length > 42) hist.shift();          // ~1s of rolling window at 60fps
+  const avg = hist.reduce(function (a, b) { return a + b; }, 0) / hist.length;
+
+  const isBeat = audioViz.bass > avg * CONFIG.audioBeatSensitivity &&
+                 audioViz.bass > CONFIG.audioBeatFloor &&
+                 (t - audioViz.lastBeat) > CONFIG.audioBeatMinInterval;
+  if (isBeat) {
+    audioViz.lastBeat = t;
+    audioViz.flash = 1.0;
+    audioViz.spinVel += CONFIG.audioSpinImpulse * (0.6 + audioViz.bass * 0.8);
+
+    audioViz.colorFrom.lerp(audioViz.colorTo, audioViz.colorT);   // freeze at wherever the fade currently is
+    const palette = CONFIG.audioStrobeColors;
+    let next = Math.floor(Math.random() * palette.length);
+    if (next === audioViz.colorIdx) next = (next + 1) % palette.length;
+    audioViz.colorIdx = next;
+    audioViz.colorTo.set(palette[next]);
+    audioViz.colorT = 0;
+  }
+
+  audioViz.colorT = Math.min(1, audioViz.colorT + dt * 6);
+  audioViz.flash *= Math.exp(-dt * CONFIG.audioFlashDecay);
+  audioViz.spinVel += audioViz.overall * CONFIG.audioSpinDrive * dt;
+}
+
 if (spinBtn) {
   spinBtn.addEventListener('click', function () {
-    rackSpin = {
-      start: clock.elapsedTime, duration: 2.0,
-      fromRot: racks.map(function (r) { return r.group.rotation.y; })
-    };
+    ensureAudioGraph();
+    if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+
     spinSound.currentTime = 0;
-    spinSound.play();
+    spinSound.play().catch(function () {});    // ignore interrupted-play rejections
+
+    audioViz.active = true;
+    audioViz.bassHistory.length = 0;
+    audioViz.lastBeat = -1;
+    audioViz.spinVel += CONFIG.audioSpinKick;
+  });
+  spinSound.addEventListener('ended', function () {
+    audioViz.active = false;
+    audioViz.flash = 0;
   });
 }
 
@@ -1782,12 +1914,14 @@ function tick() {
   const t = clock.elapsedTime;
   frame++;
 
-  if (rackSpin) {
-    const p = Math.min((t - rackSpin.start) / rackSpin.duration, 1);
-    racks.forEach(function (r, i) {
-      r.group.rotation.y = rackSpin.fromRot[i] + p * Math.PI * 2 * 10;
-    });
-    if (p >= 1) rackSpin = null;
+  if (!reduceMotion) sampleAudio(t, dt);       // updates audioViz.spinVel/flash/colors from the track
+
+  if (audioViz.spinVel > 0.0005) {
+    audioViz.spinVel *= Math.exp(-dt * CONFIG.audioSpinDrag);
+    const dAngle = audioViz.spinVel * dt;
+    racks.forEach(function (r) { r.group.rotation.y += dAngle; });
+  } else {
+    audioViz.spinVel = 0;
   }
 
   pointer.x += (pointer.tx - pointer.x) * 0.035;   // smooth so parallax never snaps
@@ -1803,14 +1937,28 @@ function tick() {
       racks.forEach(function (r) { r.monitors.forEach(function (m) { m.draw(t); }); });
     }
     hazeSprites.forEach(function (s, i) {
-      s.material.opacity = 0.028 + 0.018 * (0.5 + 0.5 * Math.sin(t * 0.21 + i));
+      s.material.opacity = 0.028 + 0.018 * (0.5 + 0.5 * Math.sin(t * 0.21 + i)) +
+        (audioViz.active ? audioViz.flash * 0.06 : 0);
     });
-    coolLight.intensity = CONFIG.accentPower * (0.9 + 0.1 * Math.sin(t * 0.9));
+    if (audioViz.active) {
+      coolLight.color.copy(strobeScratch);
+      coolLight.intensity = CONFIG.accentPower * (1.0 + audioViz.flash * 3.0);
+    } else {
+      if (coolLight.color.getHex() !== CONFIG.accentColor) coolLight.color.set(CONFIG.accentColor);
+      coolLight.intensity = CONFIG.accentPower * (0.9 + 0.1 * Math.sin(t * 0.9));
+    }
   }
 
   updateCamera(t);
-  renderPost(t);
+  renderPost(t, audioViz.active ? audioViz.flash : 0, audioViz.active ? audioViz.overall : 0);
   placeSpinBtn();
+
+  if (bgScrim) {
+    bgScrim.style.background = (audioViz.active && audioViz.flash > 0.02)
+      ? 'radial-gradient(circle at 50% 32%, rgba(255,45,220,' + (0.22 * audioViz.flash).toFixed(3) +
+        ') 0%, rgba(154,48,255,' + (0.14 * audioViz.flash).toFixed(3) + ') 35%, transparent 68%)'
+      : 'transparent';
+  }
 
   if (!booted && frame > 2) {
     booted = true;
